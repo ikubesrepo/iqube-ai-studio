@@ -28,7 +28,7 @@ sender_name = ""
 min_interval_seconds = 60
 
 [storage]
-max_file_size_mb = 50
+max_file_size_mb = 200
 
 [realtime]
 retention_days = 0
