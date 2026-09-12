@@ -22,7 +22,12 @@ type SidebarUser = {
   profile?: { name?: string | null; avatar_url?: string | null } | null;
 };
 
-export function AppSidebar({ user }: { user: SidebarUser }) {
+type BillingInfo = {
+  credits: number;
+  plan?: string;
+};
+
+export function AppSidebar({ user, billing }: { user: SidebarUser; billing?: BillingInfo }) {
   const pathname = usePathname();
 
   return (
@@ -65,7 +70,7 @@ export function AppSidebar({ user }: { user: SidebarUser }) {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarFooterPanel user={user} />
+      <SidebarFooterPanel billing={billing} user={user} />
 
       <SidebarRail />
     </Sidebar>
