@@ -30,10 +30,14 @@ export function VoiceCard({
   voice,
   onUse,
   onPreviewRequested,
+  useLabel = "Use for TTS",
+  selected = false,
 }: {
   voice: VoiceCardData;
   onUse?: (voice: VoiceCardData) => void;
   onPreviewRequested?: (voice: VoiceCardData) => Promise<string | null>;
+  useLabel?: string;
+  selected?: boolean;
 }) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
@@ -81,7 +85,12 @@ export function VoiceCard({
   }
 
   return (
-    <div className="group relative flex flex-col gap-3 overflow-hidden rounded-[calc(var(--radius)*1.5)] border border-border/60 bg-card p-4 shadow-xs transition-all duration-200 hover:border-primary/50 hover:shadow-[0_20px_45px_-30px_rgba(15,124,255,0.45)]">
+    <div
+      className={cn(
+        "group relative flex flex-col gap-3 overflow-hidden rounded-[calc(var(--radius)*1.5)] border bg-card p-4 shadow-xs transition-all duration-200 hover:border-primary/50 hover:shadow-[0_20px_45px_-30px_rgba(15,124,255,0.45)]",
+        selected ? "border-primary ring-2 ring-primary/30" : "border-border/60",
+      )}
+    >
       <div className="flex items-start justify-between gap-2">
         <div
           className={cn(
@@ -115,8 +124,8 @@ export function VoiceCard({
           {isLoadingPreview ? <Loader2Icon className="animate-spin" /> : isPlaying ? <PauseIcon /> : <PlayIcon />}
           {isPlaying ? "Pause" : "Play Preview"}
         </Button>
-        <Button className="flex-1" disabled={!isUsable} onClick={() => onUse?.(voice)} size="sm" variant="default">
-          Use for TTS
+        <Button className="flex-1" disabled={!isUsable} onClick={() => onUse?.(voice)} size="sm" variant={selected ? "secondary" : "default"}>
+          {selected ? "Selected" : useLabel}
         </Button>
         {voice.type === "Custom" ? (
           <ConfirmDeleteDialog
