@@ -1,0 +1,11 @@
+-- The voice_reference_present CHECK conflicted with voice_clone_id's
+-- ON DELETE SET NULL behavior: deleting a voice_clones row (per the
+-- clone-cloning-failure/delete flow) nulls voice_clone_id on any
+-- tts_generations rows that used it, and if default_voice_id was also null
+-- (a custom-voice generation), that update violated the CHECK and made the
+-- delete fail entirely. voice_label already denormalizes the display name
+-- for history, so losing both references on clone deletion is expected and
+-- fine -- the "exactly one reference" invariant is enforced at insert time
+-- by the application (generateTtsAction), not required as a standing
+-- constraint on the row.
+ALTER TABLE public.tts_generations DROP CONSTRAINT voice_reference_present;
