@@ -102,6 +102,39 @@ export function CreateVideoAvatarForm({
     }
   }, [run, avatarVideoId]);
 
+  // Safety net: the realtime channel can silently miss its final event on
+  // long-running tasks (observed: the UI stayed stuck on an in-progress
+  // step even though the backend had already finished). Poll the actual DB
+  // status independently so completion/failure is still detected even if
+  // realtime never delivers it. Whichever path (realtime or poll) resolves
+  // first flips `status`, which tears down the other effect via its
+  // `cancelled` cleanup before its own in-flight check can double-fire.
+  useEffect(() => {
+    if (!avatarVideoId || status !== "generating") return;
+
+    let cancelled = false;
+    const interval = setInterval(() => {
+      getAvatarVideoStatusAction(avatarVideoId)
+        .then((data) => {
+          if (cancelled || !data) return;
+          if (data.status === "completed" && data.video_url) {
+            setResult({ video_url: data.video_url, title: data.title });
+            setStatus("completed");
+            toast.add({ type: "success", title: "Video ready", description: "Your avatar video finished generating." });
+          } else if (data.status === "failed") {
+            setErrorMessage(data.error_message || "Generation failed. Please try again.");
+            setStatus("failed");
+          }
+        })
+        .catch(() => {});
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [avatarVideoId, status]);
+
   const progress = run?.metadata?.progress as { step: string; percentage: number } | undefined;
   const cost = computeVideoCreditsCost(durationSeconds);
   const insufficientCredits = cost > creditsBalance;

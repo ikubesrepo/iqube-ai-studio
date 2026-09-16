@@ -1,6 +1,20 @@
 import "server-only";
 
+import { heartbeats } from "@trigger.dev/sdk";
+
+import { fetchUrlToBuffer, splitAudioIntoChunks } from "@/lib/dashboard/voice-cloning/audio";
+import { concatVideoBuffers } from "@/lib/dashboard/video-avatars/video-concat";
+
 const DOMOAI_BASE_URL = "https://api.domoai.com";
+
+// DomoAI's talking-avatar endpoint rejects requests over 3 seconds
+// ("Target video duration cannot exceed 3s", confirmed via a live 400
+// response -- contradicts the 1-60s range implied by partial docs).
+// Callers needing a longer result must generate multiple <=3s clips and
+// concatenate them (see lib/dashboard/video-avatars/video-concat.ts);
+// this constant is also a defense-in-depth clamp here in case a caller
+// ever passes more.
+export const DOMOAI_MAX_CLIP_SECONDS = 3;
 
 export type DomoaiTaskStatus = "PENDING" | "QUEUING" | "PROCESSING" | "SUCCESS" | "FAILED" | "CANCELED";
 
@@ -58,7 +72,10 @@ export async function submitTalkingAvatarTask(input: {
       model: "talking-avatar-v1",
       image: { bytes_base64_encoded: input.imageBase64 },
       audio: { bytes_base64_encoded: input.audioBase64 },
-      seconds: input.seconds,
+      // DomoAI requires an integer number of seconds -- our chunk durations
+      // come from real audio-slice lengths (fractional), so round after
+      // clamping to the 3s cap, with a 1s floor since 0 isn't valid either.
+      seconds: Math.max(1, Math.round(Math.min(input.seconds, DOMOAI_MAX_CLIP_SECONDS))),
       aspect_ratio: input.aspectRatio,
       prompt: input.prompt,
     }),
@@ -143,4 +160,55 @@ export async function pollTaskUntilTerminal(
   }
 
   throw new Error("Timed out waiting for DomoAI video generation");
+}
+
+async function fetchAsBase64(url: string): Promise<string> {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch source image: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  // Local `trigger dev` on Windows can't checkpoint a waiting run (Trigger.dev's
+  // checkpoint system is Linux/CRIU-only), so yielding around this synchronous
+  // conversion keeps this run's heartbeat serviced during local dev.
+  await heartbeats.yield();
+  const data = buffer.toString("base64");
+  await heartbeats.yield();
+
+  return data;
+}
+
+/**
+ * Generates a talking-avatar video for the full narration length via DomoAI,
+ * working around its 3-second-per-request cap by splitting the narration
+ * into <=3s chunks, generating one avatar clip per chunk, and stitching
+ * them back together. This is the DomoAI-specific half of
+ * lib/dashboard/video-avatars/talking-avatar.ts's provider fallback.
+ */
+export async function generateDomoaiTalkingAvatarVideo(input: {
+  avatarImageUrl: string;
+  narrationMp3: Buffer;
+  aspectRatio: "16:9" | "9:16";
+}): Promise<Buffer> {
+  const imageBase64 = await fetchAsBase64(input.avatarImageUrl);
+  const audioChunks = await splitAudioIntoChunks(input.narrationMp3, DOMOAI_MAX_CLIP_SECONDS);
+
+  const clipTaskIds: string[] = [];
+  for (const chunk of audioChunks) {
+    const { taskId } = await submitTalkingAvatarTask({
+      imageBase64,
+      audioBase64: chunk.buffer.toString("base64"),
+      seconds: chunk.durationSeconds,
+      aspectRatio: input.aspectRatio,
+    });
+    clipTaskIds.push(taskId);
+  }
+
+  const clipVideos = await Promise.all(clipTaskIds.map((taskId) => pollTaskUntilTerminal(taskId)));
+  await heartbeats.yield();
+  const clipBuffers = await Promise.all(clipVideos.map((video) => fetchUrlToBuffer(video.url)));
+  return concatVideoBuffers(clipBuffers);
 }
