@@ -192,17 +192,29 @@ export async function generateDomoaiTalkingAvatarVideo(input: {
   avatarImageUrl: string;
   narrationMp3: Buffer;
   aspectRatio: "16:9" | "9:16";
+  prompt?: string;
 }): Promise<Buffer> {
   const imageBase64 = await fetchAsBase64(input.avatarImageUrl);
   const audioChunks = await splitAudioIntoChunks(input.narrationMp3, DOMOAI_MAX_CLIP_SECONDS);
 
   const clipTaskIds: string[] = [];
-  for (const chunk of audioChunks) {
+  for (const [index, chunk] of audioChunks.entries()) {
+    // Diagnostic-only: comparing these numbers between a working call (AI
+    // Video Avatars) and a failing one (AI Video Agent, error_code 1002
+    // "Audio processing failed") narrows down whether the audio buffer
+    // itself is malformed/too-short/empty before it ever reaches DomoAI.
+    // The first bytes should read as an mp3 frame sync (ff fb/ff f3/ff f2)
+    // or an ID3 tag (49 44 33) -- anything else means a corrupt buffer.
+    console.log(
+      `[domoai] chunk ${index + 1}/${audioChunks.length}: durationSeconds=${chunk.durationSeconds} byteLength=${chunk.buffer.length} firstBytes=${chunk.buffer.subarray(0, 8).toString("hex")}`,
+    );
+
     const { taskId } = await submitTalkingAvatarTask({
       imageBase64,
       audioBase64: chunk.buffer.toString("base64"),
       seconds: chunk.durationSeconds,
       aspectRatio: input.aspectRatio,
+      prompt: input.prompt,
     });
     clipTaskIds.push(taskId);
   }

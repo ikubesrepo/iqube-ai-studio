@@ -20,6 +20,7 @@ type SceneRow = {
   end_time: number;
   has_avatar_clip: boolean;
   avatar_clip_url: string | null;
+  avatar_clip_duration_seconds: number | null;
   b_roll_type: SceneBRollType | null;
   b_roll_url: string | null;
   illustration_data: { code?: string } | null;
@@ -66,6 +67,7 @@ export function buildCompositionData(project: ProjectRow, scenes: SceneRow[]): V
       endTime: scene.end_time,
       hasAvatarClip: scene.has_avatar_clip,
       avatarClipUrl: scene.avatar_clip_url,
+      avatarClipDurationSeconds: scene.avatar_clip_duration_seconds ?? undefined,
       bRollType: scene.b_roll_type,
       bRollUrl: scene.b_roll_url,
       illustrationCode: scene.illustration_data?.code ?? null,

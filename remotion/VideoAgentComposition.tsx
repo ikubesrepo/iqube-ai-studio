@@ -80,7 +80,8 @@ function buildVisualSegments(
     }
 
     if (scene.hasAvatarClip && scene.avatarClipUrl) {
-      const avatarFrames = Math.max(1, Math.round(Math.min(AVATAR_CLIP_SECONDS, sceneSeconds) * fps));
+      const avatarClipSeconds = scene.avatarClipDurationSeconds ?? AVATAR_CLIP_SECONDS;
+      const avatarFrames = Math.max(1, Math.round(Math.min(avatarClipSeconds, sceneSeconds) * fps));
       const remainderFrames = durationInFrames - avatarFrames;
 
       segments.push({ kind: "avatar", key: `${scene.id}-avatar`, durationInFrames: avatarFrames, scene });

@@ -1,15 +1,16 @@
 import { task, heartbeats } from "@trigger.dev/sdk";
 import { z } from "zod";
-import { GoogleGenAI } from "@google/genai";
-import Replicate from "replicate";
 
 import { createInsforgeAdminClient } from "@/lib/insforge/admin";
-import { extractAudioSlice, fetchUrlToBuffer } from "@/lib/dashboard/voice-cloning/audio";
-import { withReplicateRetry } from "@/lib/dashboard/voice-cloning/replicate";
+import { extractAudioSlice, fetchUrlToBuffer, getAudioDurationSeconds } from "@/lib/dashboard/voice-cloning/audio";
 import { generateTalkingAvatarVideo } from "@/lib/dashboard/video-avatars/talking-avatar";
 import { buildCompositionData } from "@/lib/dashboard/video-agent/composition-builder";
-import { searchPixabayImage, searchPixabayVideo } from "@/lib/dashboard/video-agent/pixabay";
-import { generateIllustrationComponentCode } from "@/lib/dashboard/video-agent/illustration-codegen";
+import {
+  generateAiImageBRoll,
+  generateAiIllustrationBRoll,
+  generateAiVideoBRoll,
+  generateStockBRoll,
+} from "@/lib/dashboard/video-agent/broll-generation";
 
 const payloadSchema = z.object({
   sceneId: z.string(),
@@ -29,23 +30,6 @@ const payloadSchema = z.object({
 
 type Payload = z.infer<typeof payloadSchema>;
 
-async function fetchReplicateOutputBuffer(output: unknown): Promise<Buffer> {
-  if (output && typeof output === "object" && "url" in output && typeof (output as { url: () => URL | string }).url === "function") {
-    const url = (output as { url: () => URL | string }).url();
-    const response = await fetch(url.toString());
-    if (!response.ok) throw new Error(`Failed to fetch Replicate output: ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
-  }
-
-  if (typeof output === "string") {
-    const response = await fetch(output);
-    if (!response.ok) throw new Error(`Failed to fetch Replicate output: ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
-  }
-
-  throw new Error("Unexpected Replicate output shape");
-}
-
 async function generateAvatarClip(client: ReturnType<typeof createInsforgeAdminClient>, payload: Payload) {
   if (
     !payload.avatarImageUrl ||
@@ -64,6 +48,16 @@ async function generateAvatarClip(client: ReturnType<typeof createInsforgeAdminC
   // VoiceoverAudio.tsx (the one continuous track that actually plays).
   const masterNarrationBuffer = await fetchUrlToBuffer(payload.narrationAudioUrl);
   const narrationMp3 = await extractAudioSlice(masterNarrationBuffer, payload.avatarClipStartSeconds, payload.avatarClipEndSeconds);
+
+  // Diagnostic-only: confirms whether the slice itself (before it's ever
+  // handed to DomoAI's wrapper) is already the right length / non-empty --
+  // see the matching log in generateDomoaiTalkingAvatarVideo
+  // (lib/dashboard/video-avatars/domoai.ts) for the post-chunking numbers.
+  const sliceActualDuration = await getAudioDurationSeconds(narrationMp3);
+  console.log(
+    `[generate-video-agent-scene] scene=${payload.sceneId} requestedWindow=[${payload.avatarClipStartSeconds},${payload.avatarClipEndSeconds}] ` +
+      `masterBufferBytes=${masterNarrationBuffer.length} sliceBytes=${narrationMp3.length} sliceActualDurationSeconds=${sliceActualDuration}`,
+  );
 
   await heartbeats.yield();
 
@@ -88,80 +82,6 @@ async function generateAvatarClip(client: ReturnType<typeof createInsforgeAdminC
   }
 
   return { url: upload.url, key: upload.key };
-}
-
-async function generateAiImageBRoll(client: ReturnType<typeof createInsforgeAdminClient>, payload: Payload) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Gemini is not configured yet.");
-
-  const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model: "gemini-3.1-flash-lite-image",
-    contents: [{ text: payload.visualPrompt }],
-    config: {
-      responseModalities: ["IMAGE"],
-      imageConfig: { aspectRatio: payload.aspectRatio },
-    },
-  });
-
-  const base64 = response.data;
-  if (!base64) throw new Error("Gemini did not return image data");
-
-  await heartbeats.yield();
-  const buffer = Buffer.from(base64, "base64");
-  await heartbeats.yield();
-
-  const path = `b-roll/${payload.projectId}/${payload.sceneId}.png`;
-  const { data: upload, error } = await client.storage
-    .from("video-agent")
-    .upload(path, new Blob([new Uint8Array(buffer)], { type: "image/png" }));
-
-  if (error || !upload) throw new Error(error?.message || "Failed to upload AI image b-roll");
-
-  return { type: "ai_image" as const, url: upload.url, key: upload.key };
-}
-
-async function generateStockBRoll(client: ReturnType<typeof createInsforgeAdminClient>, payload: Payload) {
-  const video = await searchPixabayVideo(payload.visualPrompt);
-
-  if (video) {
-    const buffer = await fetchUrlToBuffer(video.url);
-    const path = `b-roll/${payload.projectId}/${payload.sceneId}.mp4`;
-    const { data: upload, error } = await client.storage
-      .from("video-agent")
-      .upload(path, new Blob([new Uint8Array(buffer)], { type: "video/mp4" }));
-
-    if (error || !upload) throw new Error(error?.message || "Failed to upload stock video");
-    return { type: "stock_video" as const, url: upload.url, key: upload.key };
-  }
-
-  const image = await searchPixabayImage(payload.visualPrompt);
-  if (!image) throw new Error("No stock media found for this scene");
-
-  const buffer = await fetchUrlToBuffer(image.url);
-  const path = `b-roll/${payload.projectId}/${payload.sceneId}.jpg`;
-  const { data: upload, error } = await client.storage
-    .from("video-agent")
-    .upload(path, new Blob([new Uint8Array(buffer)], { type: "image/jpeg" }));
-
-  if (error || !upload) throw new Error(error?.message || "Failed to upload stock image");
-  return { type: "stock_image" as const, url: upload.url, key: upload.key };
-}
-
-async function generateAiVideoBRoll(client: ReturnType<typeof createInsforgeAdminClient>, payload: Payload) {
-  const replicate = new Replicate();
-  const output = await withReplicateRetry(() =>
-    replicate.run("wan-video/wan-2.2-t2v-fast", { input: { prompt: payload.visualPrompt } }),
-  );
-
-  const buffer = await fetchReplicateOutputBuffer(output);
-  const path = `b-roll/${payload.projectId}/${payload.sceneId}.mp4`;
-  const { data: upload, error } = await client.storage
-    .from("video-agent")
-    .upload(path, new Blob([new Uint8Array(buffer)], { type: "video/mp4" }));
-
-  if (error || !upload) throw new Error(error?.message || "Failed to upload AI video b-roll");
-  return { type: "ai_video" as const, url: upload.url, key: upload.key };
 }
 
 /**
@@ -199,7 +119,9 @@ async function updatePartialComposition(client: ReturnType<typeof createInsforge
   try {
     const { data: siblingScenes } = await client.database
       .from("video_agent_scenes")
-      .select("id, scene_index, start_time, end_time, status, has_avatar_clip, avatar_clip_url, b_roll_type, b_roll_url, illustration_data")
+      .select(
+        "id, scene_index, start_time, end_time, status, has_avatar_clip, avatar_clip_url, avatar_clip_duration_seconds, b_roll_type, b_roll_url, illustration_data",
+      )
       .eq("project_id", projectId)
       .order("scene_index", { ascending: true });
 
@@ -262,17 +184,18 @@ export const generateVideoAgentSceneTask = task({
 
       if (payload.needsBRoll) {
         if (payload.bRollStyle === "ai_illustration") {
-          const code = await generateIllustrationComponentCode(payload.visualPrompt, payload.sceneDurationSeconds);
+          const broll = await generateAiIllustrationBRoll(payload.visualPrompt, payload.sceneDurationSeconds);
           updates.b_roll_type = "ai_illustration";
-          updates.illustration_data = { code };
+          updates.illustration_data = { code: broll.code };
         } else {
           const broll =
             payload.bRollStyle === "ai_image"
-              ? await generateAiImageBRoll(client, payload)
+              ? await generateAiImageBRoll(client, payload.projectId, payload.sceneId, payload.visualPrompt, payload.aspectRatio)
               : payload.bRollStyle === "ai_video"
-                ? await generateAiVideoBRoll(client, payload)
-                : await generateStockBRoll(client, payload);
+                ? await generateAiVideoBRoll(client, payload.projectId, payload.sceneId, payload.visualPrompt)
+                : await generateStockBRoll(client, payload.projectId, payload.sceneId, payload.visualPrompt);
 
+          if (broll.type === "ai_illustration") throw new Error("Unexpected illustration result for non-illustration style");
           updates.b_roll_type = broll.type;
           updates.b_roll_url = broll.url;
           updates.b_roll_key = broll.key;

@@ -11,12 +11,24 @@ import { generateSadTalkerTalkingAvatarVideo } from "@/lib/dashboard/video-avata
  * issues). The fallback is intentionally broad -- any DomoAI error, not
  * just quota-specific ones -- to maximize resilience while DomoAI's
  * behavior is still being verified.
+ *
+ * Set DISABLE_DOMOAI=true (e.g. in .env.local) to skip the DomoAI attempt
+ * entirely and always use SadTalker -- useful for local/manual testing of
+ * the edit screen's avatar regeneration without spending DomoAI credits on
+ * every scene edit. Never set this in production; it's a local dev-only
+ * override read fresh on every call so toggling it doesn't require a
+ * process restart... other than the usual `next dev`/`trigger dev` reload.
  */
 export async function generateTalkingAvatarVideo(input: {
   avatarImageUrl: string;
   narrationMp3: Buffer;
   aspectRatio: "16:9" | "9:16";
+  prompt?: string;
 }): Promise<Buffer> {
+  if (process.env.DISABLE_DOMOAI === "true") {
+    return await generateSadTalkerTalkingAvatarVideo(input);
+  }
+
   try {
     return await generateDomoaiTalkingAvatarVideo(input);
   } catch (err) {
