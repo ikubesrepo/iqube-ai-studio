@@ -66,6 +66,12 @@ export const generateVideoAvatarTask = task({
 
       metadata.set("progress", { step: STEPS.generatingVideo, percentage: 40 });
 
+      // Diagnostic-only: this is the "known good" baseline (this path
+      // reliably succeeds against DomoAI) to compare against the failing
+      // AI Video Agent numbers logged in generate-video-agent-scene.ts /
+      // domoai.ts for the same error_code 1002 investigation.
+      console.log(`[generate-video-avatar] avatarVideoId=${payload.avatarVideoId} narrationBytes=${narrationMp3.length}`);
+
       // Provider fallback (DomoAI primary, SadTalker via Replicate if it
       // fails) and DomoAI's 3s-per-request chunking/stitching both live in
       // lib/dashboard/video-avatars/talking-avatar.ts -- progress can't be

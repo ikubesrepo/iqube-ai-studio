@@ -2,6 +2,7 @@ import { task, tasks, metadata } from "@trigger.dev/sdk";
 import { z } from "zod";
 
 import { createInsforgeAdminClient } from "@/lib/insforge/admin";
+import { getAudioDurationSeconds } from "@/lib/dashboard/voice-cloning/audio";
 import { synthesizeNarration } from "@/lib/dashboard/video-avatars/narration";
 import { planScenes } from "@/lib/dashboard/video-agent/scene-planner";
 import { transcribeWithTimestamps } from "@/lib/dashboard/video-agent/deepgram-stt";
@@ -106,6 +107,23 @@ export const generateVideoAgentTask = task({
         defaultVoiceModelId: payload.defaultVoiceModelId,
       });
 
+      // Safety net against a TTS provider silently truncating long text
+      // (observed with Chatterbox on long scripts, chunked/stitched in
+      // narration.ts, but this check catches any provider/regression):
+      // fail loudly with a clear, refundable error rather than silently
+      // shipping a video shorter than the user requested. 70% tolerance
+      // allows for scripts that naturally narrate a bit faster/slower than
+      // the 150wpm pacing assumption used to size the script.
+      const narrationDurationSeconds = await getAudioDurationSeconds(narrationMp3);
+      const minAcceptableSeconds = payload.durationSeconds * 0.7;
+
+      if (narrationDurationSeconds < minAcceptableSeconds) {
+        throw new Error(
+          `Narration came out to ${narrationDurationSeconds.toFixed(1)}s, well short of the requested ${payload.durationSeconds}s ` +
+            "(the voice provider likely truncated a long script) -- please try again.",
+        );
+      }
+
       const narrationPath = `narration/${payload.projectId}.mp3`;
       const { data: narrationUpload, error: narrationError } = await client.storage
         .from("video-agent")
@@ -188,6 +206,13 @@ export const generateVideoAgentTask = task({
             avatarClipStartSeconds: hasAvatarClip ? scene.start_time : undefined,
             avatarClipEndSeconds: hasAvatarClip ? Math.min(scene.start_time + AVATAR_CLIP_SECONDS, scene.end_time) : undefined,
           },
+          // Scenes run strictly serialized (queue.concurrencyLimit: 1 on
+          // generate-video-agent-scene), so a later scene can end up
+          // waiting past Trigger.dev's local-dev-only 10-minute default
+          // ttl before its turn even starts, getting killed as "Expired"
+          // for a reason that has nothing to do with the scene itself.
+          // ttl: 0 disables that dev-only safety net.
+          options: { ttl: 0 },
         };
       });
 
@@ -210,7 +235,9 @@ export const generateVideoAgentTask = task({
       metadata.set("progress", { step: STEPS.creatingComposition, percentage: 78 });
       const { data: finalScenes, error: finalScenesError } = await client.database
         .from("video_agent_scenes")
-        .select("id, scene_index, start_time, end_time, has_avatar_clip, avatar_clip_url, b_roll_type, b_roll_url, illustration_data")
+        .select(
+          "id, scene_index, start_time, end_time, has_avatar_clip, avatar_clip_url, avatar_clip_duration_seconds, b_roll_type, b_roll_url, illustration_data",
+        )
         .eq("project_id", payload.projectId)
         .order("scene_index", { ascending: true });
 

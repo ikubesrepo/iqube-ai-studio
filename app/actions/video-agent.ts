@@ -16,6 +16,8 @@ import {
   type BRollStyle,
   type VideoAgentDurationSeconds,
 } from "@/lib/dashboard/video-agent/pricing";
+import { buildCompositionData } from "@/lib/dashboard/video-agent/composition-builder";
+import { searchPixabayImages, searchPixabayVideos } from "@/lib/dashboard/video-agent/pixabay";
 import { CAPTION_PRESETS } from "@/remotion/captionPresets";
 import type { CaptionStyleId, TransitionStyleId } from "@/remotion/types";
 
@@ -46,6 +48,8 @@ export async function generateProjectScriptAction(formData: FormData) {
     throw new Error("Enter a topic for the script.");
   }
 
+  const topicText = topic.trim();
+
   if (!isVideoAgentDuration(durationSecondsRaw)) {
     throw new Error("Choose a video length before generating a script.");
   }
@@ -57,21 +61,47 @@ export async function generateProjectScriptAction(formData: FormData) {
   }
 
   const targetWords = Math.round((durationSecondsRaw / 60) * WORDS_PER_MINUTE);
+  // Undershooting the word target compounds downstream: TTS then has less
+  // text than the requested duration needs, so the final video comes out
+  // shorter than the user asked for with no error anywhere in the
+  // pipeline. Gemini reliably undershoots a loose "approximately N words"
+  // ask, so retry once with an explicit minimum before accepting a script.
+  const MIN_ACCEPTABLE_WORDS = Math.round(targetWords * 0.85);
 
   const ai = new GoogleGenAI({ apiKey });
-  const prompt = [
-    `Write a complete, natural-sounding video script for a short-form video to be narrated aloud.`,
-    `Topic: ${topic.trim()}`,
-    `The video is exactly ${durationSecondsRaw} seconds long -- write approximately ${targetWords} words so it takes about that long to narrate at a natural pace.`,
-    "Write spoken-language only (no stage directions, headings, scene labels, or emojis) -- just the words to be said.",
-  ].join("\n");
 
-  const response = await ai.models.generateContent({
-    model: "gemini-3.6-flash",
-    contents: prompt,
-  });
+  function buildPrompt(previousWordCount?: number): string {
+    return [
+      `Write a complete, natural-sounding video script for a short-form video to be narrated aloud.`,
+      `Topic: ${topicText}`,
+      `The video is exactly ${durationSecondsRaw} seconds long -- write at least ${targetWords} words (do not undershoot) so it takes about that long to narrate at a natural pace.`,
+      "Write spoken-language only (no stage directions, headings, scene labels, or emojis) -- just the words to be said.",
+      ...(previousWordCount !== undefined
+        ? [
+            `Your previous attempt was only ${previousWordCount} words, well short of the ${targetWords}-word target -- ` +
+              `expand it with more detail, examples, or elaboration until it reaches at least ${targetWords} words.`,
+          ]
+        : []),
+    ].join("\n");
+  }
 
-  const script = response.text?.trim();
+  let script: string | undefined;
+  let wordCount = 0;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.6-flash",
+      contents: buildPrompt(attempt === 0 ? undefined : wordCount),
+    });
+
+    const candidate = response.text?.trim();
+    if (!candidate) continue;
+
+    script = candidate;
+    wordCount = candidate.split(/\s+/).filter(Boolean).length;
+
+    if (wordCount >= MIN_ACCEPTABLE_WORDS) break;
+  }
 
   if (!script) {
     throw new Error("Gemini did not return a script. Try a different topic.");
@@ -269,6 +299,10 @@ export async function generateVideoAgentAction(formData: FormData) {
       creditsCharged: cost,
       refinementNotes,
       transitionStyle,
+    }, {
+      // Local dev's default 10-minute run ttl is too short for this
+      // multi-minute, serialized-queue pipeline.
+      ttl: 0,
     });
 
     await client.database.from("video_agent_projects").update({ trigger_run_id: handle.id }).eq("id", created.id);
@@ -356,7 +390,7 @@ export async function renderVideoAgentAction(projectId: string) {
       projectId,
       userId: user.id,
       creditsCharged: project.credits_charged,
-    });
+    }, { ttl: 0 }); // See generateVideoAgentAction above -- same local-dev ttl concern.
 
     await client.database.from("video_agent_projects").update({ render_trigger_run_id: handle.id }).eq("id", projectId);
 
@@ -450,4 +484,233 @@ export async function getVideoAgentCreditsBalanceAction() {
   const balance = await getCreditsBalance(client, user.id);
 
   return { balance };
+}
+
+export async function searchVideoAgentStockMediaAction(query: string, mediaType: "image" | "video") {
+  await requireUser();
+
+  if (!query.trim()) {
+    throw new Error("Enter a search term.");
+  }
+
+  return mediaType === "video" ? searchPixabayVideos(query.trim()) : searchPixabayImages(query.trim());
+}
+
+async function loadOwnedScene(client: Awaited<ReturnType<typeof createInsforgeServerClient>>, userId: string, projectId: string, sceneId: string) {
+  const { data: project, error: projectError } = await client.database
+    .from("video_agent_projects")
+    .select("id, status, aspect_ratio, avatar_id, avatar_label")
+    .eq("id", projectId)
+    .eq("user_id", userId)
+    .single();
+
+  if (projectError || !project) {
+    throw new Error("Video not found.");
+  }
+
+  if (project.status !== "awaiting_render" && project.status !== "completed") {
+    throw new Error("This video isn't ready to edit yet.");
+  }
+
+  const { data: scene, error: sceneError } = await client.database
+    .from("video_agent_scenes")
+    .select("id, start_time, end_time, visual_prompt, voiceover_segment, caption_text, b_roll_url")
+    .eq("id", sceneId)
+    .eq("project_id", projectId)
+    .eq("user_id", userId)
+    .single();
+
+  if (sceneError || !scene) {
+    throw new Error("Scene not found.");
+  }
+
+  return { project, scene };
+}
+
+export async function regenerateSceneBRollAction(
+  projectId: string,
+  sceneId: string,
+  input: { bRollStyle: BRollStyle; visualPrompt: string; stockPick?: { type: "stock_image" | "stock_video"; url: string } },
+) {
+  const user = await requireUser();
+  const client = await createInsforgeServerClient();
+
+  if (!isBRollStyle(input.bRollStyle)) {
+    throw new Error("Choose a B-roll style.");
+  }
+
+  if (!input.visualPrompt.trim() && !input.stockPick) {
+    throw new Error("Enter a prompt for this scene.");
+  }
+
+  const { project, scene } = await loadOwnedScene(client, user.id, projectId, sceneId);
+
+  await client.database.from("video_agent_scenes").update({ status: "processing" }).eq("id", sceneId);
+
+  const handle = await tasks.trigger("regenerate-video-agent-scene-broll", {
+    projectId,
+    sceneId,
+    userId: user.id,
+    bRollStyle: input.bRollStyle,
+    visualPrompt: input.visualPrompt.trim() || scene.visual_prompt || scene.caption_text,
+    aspectRatio: project.aspect_ratio,
+    sceneDurationSeconds: scene.end_time - scene.start_time,
+    stockPick: input.stockPick,
+  }, { ttl: 0 });
+
+  const publicToken = await auth.createPublicToken({ scopes: { read: { runs: [handle.id] } }, expirationTime: "1h" });
+
+  return { runId: handle.id, publicToken };
+}
+
+export async function regenerateSceneAvatarAction(
+  projectId: string,
+  sceneId: string,
+  input: { voiceCloneId?: string; defaultVoiceId?: string; prompt?: string; fallbackBRollStyle?: BRollStyle },
+) {
+  const user = await requireUser();
+  const client = await createInsforgeServerClient();
+
+  const hasVoiceClone = Boolean(input.voiceCloneId);
+  const hasDefaultVoice = Boolean(input.defaultVoiceId);
+
+  if (hasVoiceClone === hasDefaultVoice) {
+    throw new Error("Choose exactly one voice.");
+  }
+
+  const { project, scene } = await loadOwnedScene(client, user.id, projectId, sceneId);
+
+  if (!project.avatar_id) {
+    throw new Error("This video has no avatar to generate a clip from.");
+  }
+
+  const { data: avatar, error: avatarError } = await client.database
+    .from("avatars")
+    .select("crop_16_9_url, crop_9_16_url, status")
+    .eq("id", project.avatar_id)
+    .eq("user_id", user.id)
+    .single();
+
+  if (avatarError || !avatar || avatar.status !== "completed") {
+    throw new Error("This project's avatar isn't available.");
+  }
+
+  const avatarImageUrl = project.aspect_ratio === "16:9" ? avatar.crop_16_9_url : avatar.crop_9_16_url;
+
+  if (!avatarImageUrl) {
+    throw new Error(`This avatar doesn't have a ${project.aspect_ratio} version.`);
+  }
+
+  let voiceCloneAudioUrl: string | undefined;
+  let defaultVoiceModelId: string | undefined;
+
+  if (hasVoiceClone) {
+    const { data: voice, error } = await client.database
+      .from("voice_clones")
+      .select("status, cloned_audio_url")
+      .eq("id", input.voiceCloneId)
+      .eq("user_id", user.id)
+      .single();
+
+    if (error || !voice || voice.status !== "completed" || !voice.cloned_audio_url) {
+      throw new Error("This voice clone isn't ready yet.");
+    }
+
+    voiceCloneAudioUrl = voice.cloned_audio_url;
+  } else {
+    const defaultVoice = findDefaultVoice(input.defaultVoiceId as string);
+
+    if (!defaultVoice) {
+      throw new Error("Unknown default voice.");
+    }
+
+    defaultVoiceModelId = defaultVoice.id;
+  }
+
+  await client.database.from("video_agent_scenes").update({ status: "processing" }).eq("id", sceneId);
+
+  const handle = await tasks.trigger("regenerate-video-agent-scene-avatar", {
+    projectId,
+    sceneId,
+    userId: user.id,
+    avatarImageUrl,
+    aspectRatio: project.aspect_ratio,
+    sceneText: scene.voiceover_segment || scene.caption_text,
+    voiceCloneAudioUrl,
+    defaultVoiceModelId,
+    bRollStyle: input.fallbackBRollStyle,
+    prompt: input.prompt?.trim() || undefined,
+  }, { ttl: 0 });
+
+  const publicToken = await auth.createPublicToken({ scopes: { read: { runs: [handle.id] } }, expirationTime: "1h" });
+
+  return { runId: handle.id, publicToken };
+}
+
+export async function updateVideoAgentCaptionStyleAction(projectId: string, captionStyle: CaptionStyleId) {
+  const user = await requireUser();
+  const client = await createInsforgeServerClient();
+
+  if (!CAPTION_PRESETS.some((preset) => preset.id === captionStyle)) {
+    throw new Error("Unknown caption style.");
+  }
+
+  const { data: project, error: projectError } = await client.database
+    .from("video_agent_projects")
+    .select("aspect_ratio, duration_seconds, narration_audio_url, captions_data, transition_style")
+    .eq("id", projectId)
+    .eq("user_id", user.id)
+    .single();
+
+  if (projectError || !project) {
+    throw new Error("Video not found.");
+  }
+
+  const { data: scenes, error: scenesError } = await client.database
+    .from("video_agent_scenes")
+    .select(
+      "id, scene_index, start_time, end_time, has_avatar_clip, avatar_clip_url, avatar_clip_duration_seconds, b_roll_type, b_roll_url, illustration_data",
+    )
+    .eq("project_id", projectId)
+    .order("scene_index", { ascending: true });
+
+  if (scenesError || !scenes) {
+    throw new Error("Failed to load scenes.");
+  }
+
+  const compositionData = buildCompositionData({ ...project, caption_style: captionStyle }, scenes);
+
+  const { error: updateError } = await client.database
+    .from("video_agent_projects")
+    .update({ caption_style: captionStyle, composition_data: compositionData, status: "awaiting_render" })
+    .eq("id", projectId);
+
+  if (updateError) {
+    throw new Error(updateError.message);
+  }
+
+  revalidatePath("/dashboard/ai-video-agent");
+
+  return { compositionData };
+}
+
+export async function getVideoAgentSceneAction(projectId: string, sceneId: string) {
+  const user = await requireUser();
+  const client = await createInsforgeServerClient();
+
+  const { data, error } = await client.database
+    .from("video_agent_scenes")
+    .select(
+      "id, scene_index, status, error_message, start_time, end_time, has_avatar_clip, avatar_clip_url, avatar_clip_duration_seconds, b_roll_type, b_roll_url, illustration_data",
+    )
+    .eq("id", sceneId)
+    .eq("project_id", projectId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (error || !data) {
+    return null;
+  }
+
+  return data;
 }

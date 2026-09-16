@@ -2,9 +2,54 @@ import "server-only";
 
 import Replicate from "replicate";
 
-import { convertBufferToWav, convertWavBufferToMp3, fetchUrlToBuffer } from "@/lib/dashboard/voice-cloning/audio";
+import { concatAudioBuffers, convertBufferToWav, convertWavBufferToMp3, fetchUrlToBuffer } from "@/lib/dashboard/voice-cloning/audio";
 import { withReplicateRetry } from "@/lib/dashboard/voice-cloning/replicate";
 import { synthesizeDeepgramSpeech } from "@/lib/dashboard/video-avatars/deepgram-tts";
+
+// Resemble AI's Chatterbox model has no documented duration/length cap in
+// its input schema (checked live: prompt/audio_prompt/seed/cfg_weight/
+// temperature/exaggeration only), but it's an autoregressive model that in
+// practice silently truncates generation on long text instead of erroring
+// -- a 60-120s script sent in one call can come back as ~40s of audio with
+// no error, silently shipping a shorter video than requested. Chunking
+// text at sentence boundaries and stitching the results (same chunk/stitch
+// shape as DomoAI's talking-avatar 3s cap in domoai.ts) keeps each request
+// well under the point where truncation has been observed.
+const CHATTERBOX_MAX_WORDS_PER_CHUNK = 80;
+
+/**
+ * Splits text into chunks of at most `maxWords` words each, breaking only
+ * at sentence boundaries so no chunk ends mid-sentence (which would
+ * otherwise leave an audible gap/mispaced breath at the stitch point). A
+ * single sentence longer than `maxWords` is kept whole as its own chunk
+ * rather than being cut mid-sentence.
+ */
+function splitIntoSentenceChunks(text: string, maxWords: number): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g)?.map((s) => s.trim()).filter(Boolean) ?? [text.trim()];
+
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentWordCount = 0;
+
+  for (const sentence of sentences) {
+    const wordCount = sentence.split(/\s+/).filter(Boolean).length;
+
+    if (currentWordCount > 0 && currentWordCount + wordCount > maxWords) {
+      chunks.push(current.join(" "));
+      current = [];
+      currentWordCount = 0;
+    }
+
+    current.push(sentence);
+    currentWordCount += wordCount;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current.join(" "));
+  }
+
+  return chunks;
+}
 
 async function fetchOutputBuffer(output: unknown): Promise<Buffer> {
   if (output && typeof output === "object" && "url" in output && typeof (output as { url: () => URL | string }).url === "function") {
@@ -53,17 +98,24 @@ export async function synthesizeNarration(
 
   const referenceBuffer = await fetchUrlToBuffer(voice.voiceCloneAudioUrl);
   const referenceWavBuffer = await convertBufferToWav(referenceBuffer);
-
   const replicate = new Replicate();
-  const output = await withReplicateRetry(() =>
-    replicate.run("resemble-ai/chatterbox", {
-      input: {
-        prompt: text,
-        audio_prompt: referenceWavBuffer,
-      },
-    }),
-  );
 
-  const wavBuffer = await fetchOutputBuffer(output);
-  return convertWavBufferToMp3(wavBuffer);
+  const chunks = splitIntoSentenceChunks(text, CHATTERBOX_MAX_WORDS_PER_CHUNK);
+  const mp3Chunks: Buffer[] = [];
+
+  for (const chunk of chunks) {
+    const output = await withReplicateRetry(() =>
+      replicate.run("resemble-ai/chatterbox", {
+        input: {
+          prompt: chunk,
+          audio_prompt: referenceWavBuffer,
+        },
+      }),
+    );
+
+    const wavBuffer = await fetchOutputBuffer(output);
+    mp3Chunks.push(await convertWavBufferToMp3(wavBuffer));
+  }
+
+  return concatAudioBuffers(mp3Chunks);
 }

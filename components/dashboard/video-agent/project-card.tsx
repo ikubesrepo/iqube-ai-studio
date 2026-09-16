@@ -1,7 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useTransition } from "react";
-import { ClockIcon, CoinsIcon, DownloadIcon, InfoIcon, Loader2Icon, PlayIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, CoinsIcon, DownloadIcon, InfoIcon, Loader2Icon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
 
 import { deleteVideoAgentProjectAction, getVideoAgentProjectStatusAction } from "@/app/actions/video-agent";
 import { VideoPreviewDialog } from "@/components/dashboard/video-agent/video-preview-dialog";
@@ -158,6 +159,16 @@ export function ProjectCard({ project }: { project: ProjectCardData }) {
             <Button className="flex-1" disabled={!canPreview} onClick={handleOpenPreview} size="sm" variant="outline">
               <PlayIcon />
               Preview
+            </Button>
+            <Button
+              disabled={!canPreview}
+              nativeButton={false}
+              render={<Link href={`/dashboard/ai-video-agent/${project.id}/edit`} />}
+              size="icon-sm"
+              title="Edit Video"
+              variant="outline"
+            >
+              <PencilIcon />
             </Button>
             <Button
               disabled={project.status !== "completed" || !project.video_url}
