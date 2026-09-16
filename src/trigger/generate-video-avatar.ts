@@ -1,13 +1,10 @@
 import { task, metadata } from "@trigger.dev/sdk";
 import { z } from "zod";
-import Replicate from "replicate";
 
 import { createInsforgeAdminClient } from "@/lib/insforge/admin";
-import { convertBufferToWav, convertWavBufferToMp3, fetchUrlToBuffer } from "@/lib/dashboard/voice-cloning/audio";
-import { withReplicateRetry } from "@/lib/dashboard/voice-cloning/replicate";
-import { submitTalkingAvatarTask, pollTaskUntilTerminal } from "@/lib/dashboard/video-avatars/domoai";
 import { extractThumbnailFromVideoBuffer } from "@/lib/dashboard/video-avatars/thumbnail";
-import { synthesizeDeepgramSpeech } from "@/lib/dashboard/video-avatars/deepgram-tts";
+import { generateTalkingAvatarVideo } from "@/lib/dashboard/video-avatars/talking-avatar";
+import { synthesizeNarration } from "@/lib/dashboard/video-avatars/narration";
 
 const payloadSchema = z.object({
   avatarVideoId: z.string(),
@@ -35,73 +32,6 @@ const STEPS = {
   completed: "Completed",
 } as const;
 
-async function fetchAsBase64(url: string): Promise<{ data: string; mimeType: string }> {
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch source image: ${response.status}`);
-  }
-
-  const mimeType = response.headers.get("content-type") || "image/png";
-  const buffer = Buffer.from(await response.arrayBuffer());
-
-  return { data: buffer.toString("base64"), mimeType };
-}
-
-async function synthesizeNarration(
-  script: string,
-  voice: { voiceCloneAudioUrl?: string; defaultVoiceModelId?: string },
-): Promise<Buffer> {
-  if (voice.defaultVoiceModelId) {
-    return synthesizeDeepgramSpeech(voice.defaultVoiceModelId, script);
-  }
-
-  if (!voice.voiceCloneAudioUrl) {
-    throw new Error("No voice reference provided");
-  }
-
-  const referenceBuffer = await fetchUrlToBuffer(voice.voiceCloneAudioUrl);
-  const referenceWavBuffer = await convertBufferToWav(referenceBuffer);
-
-  const replicate = new Replicate();
-  const output = await withReplicateRetry(() =>
-    replicate.run("resemble-ai/chatterbox", {
-      input: {
-        prompt: script,
-        audio_prompt: referenceWavBuffer,
-      },
-    }),
-  );
-
-  const wavBuffer = await fetchOutputBuffer(output);
-  return convertWavBufferToMp3(wavBuffer);
-}
-
-async function fetchOutputBuffer(output: unknown): Promise<Buffer> {
-  if (output && typeof output === "object" && "url" in output && typeof (output as { url: () => URL | string }).url === "function") {
-    const url = (output as { url: () => URL | string }).url();
-    const response = await fetch(url.toString());
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch Replicate output: ${response.status}`);
-    }
-
-    return Buffer.from(await response.arrayBuffer());
-  }
-
-  if (typeof output === "string") {
-    const response = await fetch(output);
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch Replicate output: ${response.status}`);
-    }
-
-    return Buffer.from(await response.arrayBuffer());
-  }
-
-  throw new Error("Unexpected Replicate output shape");
-}
-
 export const generateVideoAvatarTask = task({
   id: "generate-video-avatar",
   maxDuration: 900,
@@ -113,7 +43,6 @@ export const generateVideoAvatarTask = task({
 
     try {
       metadata.set("progress", { step: STEPS.preparingAvatar, percentage: 5 });
-      const avatarImage = await fetchAsBase64(payload.avatarImageUrl);
 
       metadata.set("progress", { step: STEPS.preparingVoice, percentage: 20 });
       const narrationMp3 = await synthesizeNarration(payload.script, {
@@ -136,29 +65,23 @@ export const generateVideoAvatarTask = task({
         .eq("id", payload.avatarVideoId);
 
       metadata.set("progress", { step: STEPS.generatingVideo, percentage: 40 });
-      const { taskId } = await submitTalkingAvatarTask({
-        imageBase64: avatarImage.data,
-        audioBase64: narrationMp3.toString("base64"),
-        seconds: payload.durationSeconds,
+
+      // Provider fallback (DomoAI primary, SadTalker via Replicate if it
+      // fails) and DomoAI's 3s-per-request chunking/stitching both live in
+      // lib/dashboard/video-avatars/talking-avatar.ts -- progress can't be
+      // reported mid-call across that provider boundary, so this jumps
+      // straight from 40% to 85% once it resolves.
+      const videoBuffer = await generateTalkingAvatarVideo({
+        avatarImageUrl: payload.avatarImageUrl,
+        narrationMp3,
         aspectRatio: payload.aspectRatio,
       });
 
-      await client.database.from("avatar_videos").update({ domoai_task_id: taskId }).eq("id", payload.avatarVideoId);
-
-      let pollCount = 0;
-      const video = await pollTaskUntilTerminal(taskId, {
-        onPoll: () => {
-          pollCount++;
-          const percentage = Math.min(75, 40 + pollCount * 3);
-          metadata.set("progress", { step: STEPS.generatingVideo, percentage });
-        },
-      });
-
-      metadata.set("progress", { step: STEPS.processingOutput, percentage: 85 });
-      const videoBuffer = await fetchUrlToBuffer(video.url);
-      const thumbnailBuffer = await extractThumbnailFromVideoBuffer(videoBuffer);
-
-      metadata.set("progress", { step: STEPS.uploading, percentage: 95 });
+      // Save the video as soon as it exists, before the thumbnail step --
+      // generateTalkingAvatarVideo is the expensive, paid-for call
+      // (DomoAI/SadTalker). A thumbnail-extraction/upload failure
+      // afterward must not throw away an already-successful video.
+      metadata.set("progress", { step: STEPS.uploading, percentage: 85 });
       const videoPath = `videos/${payload.avatarVideoId}.mp4`;
       const { data: videoUpload, error: videoError } = await client.storage
         .from("avatar-videos")
@@ -168,25 +91,36 @@ export const generateVideoAvatarTask = task({
         throw new Error(videoError?.message || "Failed to upload generated video");
       }
 
-      const thumbnailPath = `thumbnails/${payload.avatarVideoId}.jpg`;
-      const { data: thumbnailUpload, error: thumbnailError } = await client.storage
-        .from("avatar-videos")
-        .upload(thumbnailPath, new Blob([new Uint8Array(thumbnailBuffer)], { type: "image/jpeg" }));
-
-      if (thumbnailError || !thumbnailUpload) {
-        throw new Error(thumbnailError?.message || "Failed to upload video thumbnail");
-      }
-
       await client.database
         .from("avatar_videos")
-        .update({
-          status: "completed",
-          video_url: videoUpload.url,
-          video_key: videoUpload.key,
-          thumbnail_url: thumbnailUpload.url,
-          thumbnail_key: thumbnailUpload.key,
-        })
+        .update({ status: "completed", video_url: videoUpload.url, video_key: videoUpload.key })
         .eq("id", payload.avatarVideoId);
+
+      // Best-effort from here on: the video is already saved, so a
+      // thumbnail failure is logged and skipped rather than failing the
+      // whole (already-successful) generation.
+      metadata.set("progress", { step: STEPS.processingOutput, percentage: 95 });
+      try {
+        const thumbnailBuffer = await extractThumbnailFromVideoBuffer(videoBuffer);
+        const thumbnailPath = `thumbnails/${payload.avatarVideoId}.jpg`;
+        const { data: thumbnailUpload, error: thumbnailError } = await client.storage
+          .from("avatar-videos")
+          .upload(thumbnailPath, new Blob([new Uint8Array(thumbnailBuffer)], { type: "image/jpeg" }));
+
+        if (thumbnailError || !thumbnailUpload) {
+          throw new Error(thumbnailError?.message || "Failed to upload video thumbnail");
+        }
+
+        await client.database
+          .from("avatar_videos")
+          .update({ thumbnail_url: thumbnailUpload.url, thumbnail_key: thumbnailUpload.key })
+          .eq("id", payload.avatarVideoId);
+      } catch (thumbnailErr) {
+        console.warn(
+          `Thumbnail generation failed for avatar video ${payload.avatarVideoId}; video is still saved.`,
+          thumbnailErr,
+        );
+      }
 
       metadata.set("progress", { step: STEPS.completed, percentage: 100 });
     } catch (err) {

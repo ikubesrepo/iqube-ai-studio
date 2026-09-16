@@ -8,6 +8,11 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "20mb",
     },
   },
+  // @remotion/bundler and @remotion/renderer drive headless Chromium and
+  // are only ever imported from Trigger.dev task files -- never a client
+  // or edge bundle. This is a defense-in-depth guard against them
+  // accidentally being pulled into an app bundle.
+  serverExternalPackages: ["@remotion/bundler", "@remotion/renderer"],
 };
 
 export default nextConfig;
